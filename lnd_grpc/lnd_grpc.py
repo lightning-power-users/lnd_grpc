@@ -1,14 +1,31 @@
 import codecs
 import sys
 from os import environ
+from typing import List
 
 import grpc
+from google.protobuf.json_format import MessageToDict
 
 from lnd_grpc import utilities as u
 from lnd_grpc.protos import rpc_pb2 as ln, rpc_pb2_grpc as lnrpc
 
 # tell gRPC which cypher suite to use
 environ["GRPC_SSL_CIPHER_SUITES"] = 'HIGH+ECDSA'
+
+
+class DefaultModel(dict):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+class PendingChannels(DefaultModel):
+    def __getattribute__(self, name):
+        try:
+            return object.__getattribute__(self, name)
+        except AttributeError:
+            return None
 
 
 class Client:
@@ -275,6 +292,27 @@ class Client:
         request = ln.ListChannelsRequest(**kwargs)
         response = self.lightning_stub.ListChannels(request)
         return response.channels
+
+    def list_pending_channels(self) -> List[PendingChannels]:
+        request = ln.PendingChannelsRequest()
+        response = self.lightning_stub.PendingChannels(request, timeout=5)
+        pending_channels = []
+        pending_types = [
+            'pending_open_channels',
+            'pending_closing_channels',
+            'pending_force_closing_channels',
+            'waiting_close_channels'
+        ]
+        for pending_type in pending_types:
+            for pending_channel in getattr(response, pending_type):
+                channel_dict = MessageToDict(pending_channel)
+                nested_data = channel_dict.pop('channel')
+                # noinspection PyDictCreation
+                flat_dict = {**channel_dict, **nested_data}
+                flat_dict['pending_type'] = pending_type
+                pending_channel_model = PendingChannels(**flat_dict)
+                pending_channels.append(pending_channel_model)
+        return pending_channels
 
     def closed_channels(self, **kwargs):
         request = ln.ClosedChannelsRequest(**kwargs)
