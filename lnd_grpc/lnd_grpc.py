@@ -1,8 +1,10 @@
 import codecs
 import sys
 from os import environ
+from typing import List
 
 import grpc
+from google.protobuf.json_format import MessageToDict
 
 from lnd_grpc import utilities as u
 from lnd_grpc.protos import rpc_pb2 as ln, rpc_pb2_grpc as lnrpc
@@ -11,17 +13,38 @@ from lnd_grpc.protos import rpc_pb2 as ln, rpc_pb2_grpc as lnrpc
 environ["GRPC_SSL_CIPHER_SUITES"] = 'HIGH+ECDSA'
 
 
+class DefaultModel(dict):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+class PendingChannels(DefaultModel):
+    def __getattribute__(self, name):
+        try:
+            return object.__getattribute__(self, name)
+        except AttributeError:
+            return None
+
+
 class Client:
 
     def __init__(self,
                  lnd_dir: str = None,
                  macaroon_path: str = None,
+                 tls_cert_path: str = None,
                  network: str = 'mainnet',
                  grpc_host: str = 'localhost',
                  grpc_port: str = '10009'):
 
+        self._lightning_stub = None
+        self._tls_cert_path = None
+        self._macaroon_path = None
+
         self.lnd_dir = lnd_dir
         self.macaroon_path = macaroon_path
+        self.tls_cert_path = tls_cert_path
         self.network = network
         self.grpc_host = grpc_host
         self.grpc_port = grpc_port
@@ -48,7 +71,8 @@ class Client:
 
     @property
     def tls_cert_path(self):
-        self._tls_cert_path = self.lnd_dir + 'tls.cert'
+        if self._tls_cert_path is None:
+            self._tls_cert_path = self.lnd_dir + 'tls.cert'
         return self._tls_cert_path
 
     @tls_cert_path.setter
@@ -70,13 +94,11 @@ class Client:
 
     @property
     def macaroon_path(self):
-        if not self._macaroon_path:
+        if self._macaroon_path is None:
             self._macaroon_path = self.lnd_dir + \
                                   'data/chain/bitcoin/%s/admin.macaroon' \
                                   % self.network
-            return self._macaroon_path
-        else:
-            return self._macaroon_path
+        return self._macaroon_path
 
     @macaroon_path.setter
     def macaroon_path(self, path):
@@ -87,8 +109,7 @@ class Client:
         try:
             with open(self.macaroon_path, 'rb') as f:
                 macaroon_bytes = f.read()
-                self._macaroon = codecs.encode(macaroon_bytes, 'hex')
-                return self._macaroon
+                return codecs.encode(macaroon_bytes, 'hex')
         except FileNotFoundError:
             sys.stderr.write("Could not find macaroon in %s\n" % self.macaroon_path)
 
@@ -102,8 +123,7 @@ class Client:
 
     @property
     def grpc_address(self):
-        self._address = str(self.grpc_host + ':' + self.grpc_port)
-        return self._address
+        return str(self.grpc_host + ':' + self.grpc_port)
 
     @staticmethod
     def channel_point_generator(funding_txid, output_index):
@@ -126,18 +146,18 @@ class Client:
     def lightning_stub(self,
                        cert_path: str = None,
                        macaroon_path: str = None):
+        if self._lightning_stub is None:
+            # set options
+            if cert_path is not None:
+                self.tls_cert_path = cert_path
+            if macaroon_path is not None:
+                self.macaroon_path = macaroon_path
 
-        # set options
-        if cert_path is not None:
-            self.tls_cert_path = cert_path
-        if macaroon_path is not None:
-            self.macaroon_path = macaroon_path
-
-        self.build_credentials()
-        self.channel = grpc.secure_channel(target=self.grpc_address,
-                                           credentials=self.combined_creds,
-                                           options=self.grpc_options)
-        self._lightning_stub = lnrpc.LightningStub(self.channel)
+            self.build_credentials()
+            self.channel = grpc.secure_channel(target=self.grpc_address,
+                                               credentials=self.combined_creds,
+                                               options=self.grpc_options)
+            self._lightning_stub = lnrpc.LightningStub(self.channel)
         return self._lightning_stub
 
     @property
@@ -272,6 +292,27 @@ class Client:
         request = ln.ListChannelsRequest(**kwargs)
         response = self.lightning_stub.ListChannels(request)
         return response.channels
+
+    def list_pending_channels(self) -> List[PendingChannels]:
+        request = ln.PendingChannelsRequest()
+        response = self.lightning_stub.PendingChannels(request, timeout=5)
+        pending_channels = []
+        pending_types = [
+            'pending_open_channels',
+            'pending_closing_channels',
+            'pending_force_closing_channels',
+            'waiting_close_channels'
+        ]
+        for pending_type in pending_types:
+            for pending_channel in getattr(response, pending_type):
+                channel_dict = MessageToDict(pending_channel)
+                nested_data = channel_dict.pop('channel')
+                # noinspection PyDictCreation
+                flat_dict = {**channel_dict, **nested_data}
+                flat_dict['pending_type'] = pending_type
+                pending_channel_model = PendingChannels(**flat_dict)
+                pending_channels.append(pending_channel_model)
+        return pending_channels
 
     def closed_channels(self, **kwargs):
         request = ln.ClosedChannelsRequest(**kwargs)
