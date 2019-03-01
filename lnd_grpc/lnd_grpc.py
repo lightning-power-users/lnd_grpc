@@ -257,15 +257,11 @@ class Client:
         response = self.lightning_stub.VerifyMessage(request)
         return response
 
-    def connect_peer(self, addr: ln.LightningAddress, perm: bool = 0):
-        request = ln.ConnectPeerRequest(addr=addr, perm=perm)
-        response = self.lightning_stub.ConnectPeer(request)
-        return response
-
-    def connect(self, address: str, perm: bool = 0):
-        pubkey, host = address.split('@')
-        _address = self.lightning_address(pubkey=pubkey, host=host)
-        response = self.connect_peer(addr=_address, perm=perm)
+    def connect_peer(self, pubkey: str, host: str,
+                     timeout: int = 3) -> ln.ConnectPeerResponse:
+        address = ln.LightningAddress(pubkey=pubkey, host=host)
+        request = ln.ConnectPeerRequest(addr=address)
+        response = self.lightning_stub.ConnectPeer(request, timeout=timeout)
         return response
 
     def disconnect_peer(self, pubkey: str):
@@ -346,8 +342,8 @@ class Client:
                 **kwargs)
         if request.node_pubkey == b'':
             request.node_pubkey = bytes.fromhex(node_pubkey_string)
-        for response in self.lightning_stub.OpenChannel(request):
-            print(response)
+        response = self.lightning_stub.OpenChannel(request)
+        return response
 
     def close_channel(self, channel_point, **kwargs):
         funding_txid, output_index = channel_point.split(':')
