@@ -1,5 +1,6 @@
 import codecs
 import sys
+import time
 from os import environ
 from typing import List
 
@@ -138,10 +139,13 @@ class Client:
         return bytes.fromhex(hex_string)
 
     @staticmethod
-    def bytes_to_hex(bytes: bytes):
-        return codecs.encode(bytes, 'hex')
+    def bytes_to_hex(bytestring: bytes):
+        return bytestring.hex()
 
     # Connection stubs will be generated dynamically for each request to ensure channel freshness
+    # This can slow down interfacing programs considerably. Performance can be increased by
+    # configuring a static lightning stub to use. This can be done simply by removing the property
+    # decorator from the stub class below.
     @property
     def lightning_stub(self,
                        cert_path: str = None,
@@ -217,18 +221,17 @@ class Client:
         response = self.lightning_stub.SendCoins(request)
         return response
 
-    # Method not available in 0.5.2-beta proto file
-    # def list_unspent(self, min_confs: int, max_confs: int):
-    #     request = ln.ListUnspentRequest(min_confs=min_confs, max_confs=max_confs)
-    #     response = self.lightning_stub.ListUnspent(request)
-    #     return response
+    def list_unspent(self, min_confs: int, max_confs: int):
+        request = ln.ListUnspentRequest(min_confs=min_confs, max_confs=max_confs)
+        response = self.lightning_stub.ListUnspent(request)
+        return response
 
+    # Response-streaming RPC
     def subscribe_transactions(self):
         request = ln.GetTransactionsRequest()
         for response in self.lightning_stub.SubscribeTransactions(request):
             return response
 
-    # TODO: check this more. It works with regular python dicts so I think it's ok
     def send_many(self, addr_to_amount: ln.SendManyRequest.AddrToAmountEntry, **kwargs):
         request = ln.SendManyRequest(AddrToAmount=addr_to_amount, **kwargs)
         response = self.lightning_stub.SendMany(request)
@@ -240,7 +243,7 @@ class Client:
         elif address_type == 'np2wkh':
             request = ln.NewAddressRequest(type='NESTED_PUBKEY_HASH')
         else:
-            return TypeError("invalid address type %s, supported address type are: p2wkh and np2wkh" \
+            return TypeError("invalid address type %s, supported address type are: p2wkh and np2wkh"
                              % address_type)
         response = self.lightning_stub.NewAddress(request)
         return response
@@ -315,35 +318,25 @@ class Client:
         response = self.lightning_stub.ClosedChannels(request)
         return response.channels
 
-    def open_channel_sync(self,
-                          node_pubkey_string: str,
-                          local_funding_amount: int,
-                          **kwargs):
-        """
-        A synchronous (blocking) version of the 'open_channel()' command
-        """
-        request = ln.OpenChannelRequest(
-                node_pubkey_string=node_pubkey_string,
-                local_funding_amount=local_funding_amount,
-                **kwargs)
-        if not hasattr(request, 'node_pubkey'):
-            request.node_pubkey = bytes.fromhex(node_pubkey_string)
+    def open_channel_sync(self, local_funding_amount: int, **kwargs):
+        request = ln.OpenChannelRequest(local_funding_amount=local_funding_amount, **kwargs)
         response = self.lightning_stub.OpenChannelSync(request)
         return response
 
-    def open_channel(self,
-                     node_pubkey_string: str,
-                     local_funding_amount: int,
-                     **kwargs):
-        # TODO: mirror `lncli openchannel --connect` function
-        request = ln.OpenChannelRequest(
-                node_pubkey_string=node_pubkey_string,
-                local_funding_amount=local_funding_amount,
-                **kwargs)
+    # Response-streaming RPC
+    def open_channel(self, local_funding_amount: int, **kwargs):
+        # TODO: implement `lncli openchannel --connect` function
+        request = ln.OpenChannelRequest(local_funding_amount=local_funding_amount, **kwargs)
         if request.node_pubkey == b'':
+<<<<<<< HEAD
             request.node_pubkey = bytes.fromhex(node_pubkey_string)
         response = self.lightning_stub.OpenChannel(request)
         return response
+=======
+            request.node_pubkey = bytes.fromhex(request.node_pubkey_string)
+        for response in self.lightning_stub.OpenChannel(request):
+            print(response)
+>>>>>>> 425751fbf63bb68b4e2c7a5f6d783efba7be9cc8
 
     def close_channel(self, channel_point, **kwargs):
         funding_txid, output_index = channel_point.split(':')
@@ -354,12 +347,12 @@ class Client:
         return response
 
     def close_all_channels(self, inactive_only: bool = 0):
-        if inactive_only == False:
+        if not inactive_only:
             for channel in self.list_channels():
-                self.close_channel(channel_point=channel.channel_point)
-        if inactive_only == True:
+                return self.close_channel(channel_point=channel.channel_point)
+        if inactive_only:
             for channel in self.list_channels(inactive_only=1):
-                self.close_channel(channel_point=channel.channel_point)
+                return self.close_channel(channel_point=channel.channel_point)
 
     def abandon_channel(self, channel_point: ln.ChannelPoint):
         funding_txid, output_index = channel_point.split(':')
@@ -371,27 +364,37 @@ class Client:
 
     @staticmethod
     def send_request_generator(**kwargs):
-        # i = 0
-         #while True:
-            if kwargs['payment_request']:
-                request = ln.SendRequest(payment_request=kwargs['payment_request'])
-            else:
-                request = ln.SendRequest(**kwargs)
+        while True:
+            request = ln.SendRequest(**kwargs)
             yield request
-        # i += 1
+            break
 
     # Bi-directional streaming RPC
     def send_payment(self, **kwargs):
-        request_iterable = self.send_request_generator(**kwargs)
+        # Use payment request as first choice
+        if 'payment_request' in kwargs:
+            request_iterable = self.send_request_generator(
+                    payment_request=kwargs['payment_request']
+            )
+        else:
+            # Helper to try and convert hex to bytes automatically
+            try:
+                if 'payment_hash' not in kwargs:
+                    kwargs['payment_hash'] = bytes.fromhex(kwargs['payment_hash_string'])
+                if 'dest' not in kwargs:
+                    kwargs['dest'] = bytes.fromhex(kwargs['dest_string'])
+            except ValueError as e:
+                raise e
+            request_iterable = self.send_request_generator(**kwargs)
         for response in self.lightning_stub.SendPayment(request_iterable):
             print(response)
 
+    # Synchronous non-streaming RPC
     def send_payment_sync(self, **kwargs):
-        if kwargs['payment_request']:
+        # Use payment request as first choice
+        if 'payment_request' in kwargs:
             request = ln.SendRequest(payment_request=kwargs['payment_request'])
         else:
-            kwargs['payment_hash'] = bytes.fromhex(kwargs['payment_hash_string'])
-            kwargs['dest'] = bytes.fromhex(kwargs['dest_string'])
             request = ln.SendRequest(**kwargs)
         response = self.lightning_stub.SendPaymentSync(request)
         return response
@@ -401,27 +404,33 @@ class Client:
         return response
 
     @staticmethod
-    def send_to_route_generator(invoices, route):
+    def send_to_route_generator(invoice, route):
         i = 0
-        j = len(invoices)
-        while i < j:
-            for invoice in invoices:
-                request = ln.SendToRouteRequest(payment_hash=invoice.r_hash, routes=route)
-                yield request
-                i += 1
+        while i < 1:
+            request = ln.SendToRouteRequest(payment_hash=invoice.r_hash, routes=route)
+            yield request
+            i += 1
 
-    def send_to_route(self, invoices, route):
-        request_iterable = self.send_to_route_generator(invoices=invoices, route=route)
+    # Bi-directional streaming RPC
+    def send_to_route(self, invoice, route):
+        request_iterable = self.send_to_route_generator(invoice=invoice, route=route)
         for response in self.lightning_stub.SendToRoute(request_iterable):
             print(response)
 
+    # Synchronous non-streaming RPC
     def send_to_route_sync(self, routes: ln.Route, **kwargs):
         request = ln.SendToRouteRequest(routes=routes, **kwargs)
         response = self.lightning_stub.SendToRouteSync(request)
         return response
 
-    def add_invoice(self, value: int = 0, **kwargs):
-        request = ln.Invoice(value=value, **kwargs)
+    def add_invoice(self,
+                    memo: str = '',
+                    value: int = 0,
+                    expiry: int = 3600,
+                    creation_date: int = int(time.time()),
+                    **kwargs):
+        request = ln.Invoice(memo=memo, value=value, expiry=expiry,
+                             creation_date=creation_date, **kwargs)
         response = self.lightning_stub.AddInvoice(request)
         return response
 
@@ -438,7 +447,7 @@ class Client:
     def subscribe_invoices(self, **kwargs):
         request = ln.InvoiceSubscription(**kwargs)
         for response in self.lightning_stub.SubscribeInvoices(request):
-            return response
+            print(response)
 
     def decode_pay_req(self, pay_req: str):
         request = ln.PayReqString(pay_req=pay_req)
@@ -464,6 +473,12 @@ class Client:
         request = ln.ChanInfoRequest(chan_id=chan_id)
         response = self.lightning_stub.GetChanInfo(request)
         return response
+
+    # Uni-directional stream
+    def subscribe_channel_events(self, **kwargs):
+        request = ln.ChannelEventSubscription(**kwargs)
+        for response in self.lightning_stub.SubscribeChannelEvents(request):
+            print(response)
 
     def get_node_info(self, pub_key: str):
         request = ln.NodeInfoRequest(pub_key=pub_key)
@@ -493,10 +508,11 @@ class Client:
         response = self.lightning_stub.StopDaemon(request)
         return response
 
+    # Response-streaming RPC
     def subscribe_channel_graph(self):
         request = ln.GraphTopologySubscription()
         for response in self.lightning_stub.SubscribeChannelGraph(request):
-            return response
+            print(response)
 
     def debug_level(self, **kwargs):
         request = ln.DebugLevelRequest(**kwargs)
@@ -514,7 +530,7 @@ class Client:
             _channel_point = self.channel_point_generator(funding_txid=funding_txid,
                                                           output_index=output_index)
             kwargs['chan_point'] = _channel_point
-        if not 'global' in kwargs:
+        if 'global' not in kwargs:
             kwargs['global'] = 1
         request = ln.PolicyUpdateRequest(**kwargs)
         response = self.lightning_stub.UpdateChannelPolicy(request)
