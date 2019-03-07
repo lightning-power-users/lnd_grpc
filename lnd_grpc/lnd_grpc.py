@@ -371,30 +371,26 @@ class Client:
 
     @staticmethod
     def send_request_generator(**kwargs):
-        # i = 0
-         #while True:
-            if kwargs['payment_request']:
-                request = ln.SendRequest(payment_request=kwargs['payment_request'])
-            else:
-                request = ln.SendRequest(**kwargs)
-            yield request
-        # i += 1
+        if kwargs['payment_request']:
+            request = ln.SendRequest(payment_request=kwargs['payment_request'])
+        else:
+            request = ln.SendRequest(**kwargs)
+        yield request
 
     # Bi-directional streaming RPC
     def send_payment(self, **kwargs):
         request_iterable = self.send_request_generator(**kwargs)
-        for response in self.lightning_stub.SendPayment(request_iterable):
-            print(response)
-
-    def send_payment_sync(self, **kwargs):
-        if kwargs['payment_request']:
-            request = ln.SendRequest(payment_request=kwargs['payment_request'])
-        else:
-            kwargs['payment_hash'] = bytes.fromhex(kwargs['payment_hash_string'])
-            kwargs['dest'] = bytes.fromhex(kwargs['dest_string'])
-            request = ln.SendRequest(**kwargs)
-        response = self.lightning_stub.SendPaymentSync(request)
+        response = self.lightning_stub.SendPayment(request_iterable)
         return response
+
+    def send_payment_sync(self, payment_request, routes):
+        payment_hash = payment_request.payment_hash
+        request = ln.SendToRouteRequest()
+
+        request.payment_hash_string = payment_hash
+        request.routes.extend(routes)
+
+        return self.lightning_stub.SendToRouteSync(request)
 
     def pay_invoice(self, payment_request: str):
         response = self.send_payment_sync(payment_request=payment_request)
