@@ -2,7 +2,7 @@
 
 A simple library to provide a Python 3 interface to the lnd lightning client gRPC.
 
-This version of the library has been compiled with rpc.proto from the v0.5.2-beta tag on github
+This version of the library has been compiled with rpc.proto from the v0.5.1-beta tag on github
 
 ## Install requires:
 * `grpcio`
@@ -46,9 +46,9 @@ Create an instance of the client class:
 
 `rpc = lnd_grpc.Client()`
 
-Note: The class is instantiated to work with default bitcoind rpc port and lnd in default installation directory, on mainnet, unless additional arguments are passed.
+Note: The class is instantiated to work with default bitcoind rpc port and lnd in default installation path unless additional arguments are passed.
 
-The class instantiation takes the the following arguments which you can change as required:
+The class instantiation takes the the following arguments which you can change as required by your bitcoin node setup:
 
 ```
     (
@@ -86,3 +86,5 @@ Further RPC commands can then be issued to the lnd gRPC interface using the foll
 
 Valid gRPC commands and their keyword arguments can be found [here](https://api.lightning.community/?python#lnd-grpc-api-reference)
  
+### Additional Notes
+This library will handle gRPC errors for functions decorated with @handle_error and will also alert for invalid/missing tls cert and macaroon.

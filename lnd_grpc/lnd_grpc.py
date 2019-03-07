@@ -1,9 +1,10 @@
 import codecs
 import sys
-import time
 from os import environ
+from typing import List
 
 import grpc
+from google.protobuf.json_format import MessageToDict
 
 from lnd_grpc import utilities as u
 from lnd_grpc.protos import rpc_pb2 as ln, rpc_pb2_grpc as lnrpc
@@ -12,17 +13,38 @@ from lnd_grpc.protos import rpc_pb2 as ln, rpc_pb2_grpc as lnrpc
 environ["GRPC_SSL_CIPHER_SUITES"] = 'HIGH+ECDSA'
 
 
+class DefaultModel(dict):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+class PendingChannels(DefaultModel):
+    def __getattribute__(self, name):
+        try:
+            return object.__getattribute__(self, name)
+        except AttributeError:
+            return None
+
+
 class Client:
 
     def __init__(self,
                  lnd_dir: str = None,
                  macaroon_path: str = None,
+                 tls_cert_path: str = None,
                  network: str = 'mainnet',
                  grpc_host: str = 'localhost',
                  grpc_port: str = '10009'):
 
+        self._lightning_stub = None
+        self._tls_cert_path = None
+        self._macaroon_path = None
+
         self.lnd_dir = lnd_dir
         self.macaroon_path = macaroon_path
+        self.tls_cert_path = tls_cert_path
         self.network = network
         self.grpc_host = grpc_host
         self.grpc_port = grpc_port
@@ -49,7 +71,8 @@ class Client:
 
     @property
     def tls_cert_path(self):
-        self._tls_cert_path = self.lnd_dir + 'tls.cert'
+        if self._tls_cert_path is None:
+            self._tls_cert_path = self.lnd_dir + 'tls.cert'
         return self._tls_cert_path
 
     @tls_cert_path.setter
@@ -71,13 +94,11 @@ class Client:
 
     @property
     def macaroon_path(self):
-        if not self._macaroon_path:
+        if self._macaroon_path is None:
             self._macaroon_path = self.lnd_dir + \
                                   'data/chain/bitcoin/%s/admin.macaroon' \
                                   % self.network
-            return self._macaroon_path
-        else:
-            return self._macaroon_path
+        return self._macaroon_path
 
     @macaroon_path.setter
     def macaroon_path(self, path):
@@ -88,8 +109,7 @@ class Client:
         try:
             with open(self.macaroon_path, 'rb') as f:
                 macaroon_bytes = f.read()
-                self._macaroon = codecs.encode(macaroon_bytes, 'hex')
-                return self._macaroon
+                return codecs.encode(macaroon_bytes, 'hex')
         except FileNotFoundError:
             sys.stderr.write("Could not find macaroon in %s\n" % self.macaroon_path)
 
@@ -103,8 +123,7 @@ class Client:
 
     @property
     def grpc_address(self):
-        self._address = str(self.grpc_host + ':' + self.grpc_port)
-        return self._address
+        return str(self.grpc_host + ':' + self.grpc_port)
 
     @staticmethod
     def channel_point_generator(funding_txid, output_index):
@@ -119,29 +138,26 @@ class Client:
         return bytes.fromhex(hex_string)
 
     @staticmethod
-    def bytes_to_hex(bytestring: bytes):
-        return bytestring.hex()
+    def bytes_to_hex(bytes: bytes):
+        return codecs.encode(bytes, 'hex')
 
     # Connection stubs will be generated dynamically for each request to ensure channel freshness
-    # This can slow down interfacing programs considerably. Performance can be increased by
-    # configuring a static lightning stub to use. This can be done simply by removing the property
-    # decorator from the stub class below.
     @property
     def lightning_stub(self,
                        cert_path: str = None,
                        macaroon_path: str = None):
+        if self._lightning_stub is None:
+            # set options
+            if cert_path is not None:
+                self.tls_cert_path = cert_path
+            if macaroon_path is not None:
+                self.macaroon_path = macaroon_path
 
-        # set options
-        if cert_path is not None:
-            self.tls_cert_path = cert_path
-        if macaroon_path is not None:
-            self.macaroon_path = macaroon_path
-
-        self.build_credentials()
-        self.channel = grpc.secure_channel(target=self.grpc_address,
-                                           credentials=self.combined_creds,
-                                           options=self.grpc_options)
-        self._lightning_stub = lnrpc.LightningStub(self.channel)
+            self.build_credentials()
+            self.channel = grpc.secure_channel(target=self.grpc_address,
+                                               credentials=self.combined_creds,
+                                               options=self.grpc_options)
+            self._lightning_stub = lnrpc.LightningStub(self.channel)
         return self._lightning_stub
 
     @property
@@ -201,17 +217,18 @@ class Client:
         response = self.lightning_stub.SendCoins(request)
         return response
 
-    def list_unspent(self, min_confs: int, max_confs: int):
-        request = ln.ListUnspentRequest(min_confs=min_confs, max_confs=max_confs)
-        response = self.lightning_stub.ListUnspent(request)
-        return response
+    # Method not available in 0.5.2-beta proto file
+    # def list_unspent(self, min_confs: int, max_confs: int):
+    #     request = ln.ListUnspentRequest(min_confs=min_confs, max_confs=max_confs)
+    #     response = self.lightning_stub.ListUnspent(request)
+    #     return response
 
-    # Response-streaming RPC
     def subscribe_transactions(self):
         request = ln.GetTransactionsRequest()
         for response in self.lightning_stub.SubscribeTransactions(request):
             return response
 
+    # TODO: check this more. It works with regular python dicts so I think it's ok
     def send_many(self, addr_to_amount: ln.SendManyRequest.AddrToAmountEntry, **kwargs):
         request = ln.SendManyRequest(AddrToAmount=addr_to_amount, **kwargs)
         response = self.lightning_stub.SendMany(request)
@@ -223,7 +240,7 @@ class Client:
         elif address_type == 'np2wkh':
             request = ln.NewAddressRequest(type='NESTED_PUBKEY_HASH')
         else:
-            return TypeError("invalid address type %s, supported address type are: p2wkh and np2wkh"
+            return TypeError("invalid address type %s, supported address type are: p2wkh and np2wkh" \
                              % address_type)
         response = self.lightning_stub.NewAddress(request)
         return response
@@ -240,15 +257,11 @@ class Client:
         response = self.lightning_stub.VerifyMessage(request)
         return response
 
-    def connect_peer(self, addr: ln.LightningAddress, perm: bool = 0):
-        request = ln.ConnectPeerRequest(addr=addr, perm=perm)
-        response = self.lightning_stub.ConnectPeer(request)
-        return response
-
-    def connect(self, address: str, perm: bool = 0):
-        pubkey, host = address.split('@')
-        _address = self.lightning_address(pubkey=pubkey, host=host)
-        response = self.connect_peer(addr=_address, perm=perm)
+    def connect_peer(self, pubkey: str, host: str,
+                     timeout: int = 3) -> ln.ConnectPeerResponse:
+        address = ln.LightningAddress(pubkey=pubkey, host=host)
+        request = ln.ConnectPeerRequest(addr=address)
+        response = self.lightning_stub.ConnectPeer(request, timeout=timeout)
         return response
 
     def disconnect_peer(self, pubkey: str):
@@ -276,24 +289,61 @@ class Client:
         response = self.lightning_stub.ListChannels(request)
         return response.channels
 
+    def list_pending_channels(self) -> List[PendingChannels]:
+        request = ln.PendingChannelsRequest()
+        response = self.lightning_stub.PendingChannels(request, timeout=5)
+        pending_channels = []
+        pending_types = [
+            'pending_open_channels',
+            'pending_closing_channels',
+            'pending_force_closing_channels',
+            'waiting_close_channels'
+        ]
+        for pending_type in pending_types:
+            for pending_channel in getattr(response, pending_type):
+                channel_dict = MessageToDict(pending_channel)
+                nested_data = channel_dict.pop('channel')
+                # noinspection PyDictCreation
+                flat_dict = {**channel_dict, **nested_data}
+                flat_dict['pending_type'] = pending_type
+                pending_channel_model = PendingChannels(**flat_dict)
+                pending_channels.append(pending_channel_model)
+        return pending_channels
+
     def closed_channels(self, **kwargs):
         request = ln.ClosedChannelsRequest(**kwargs)
         response = self.lightning_stub.ClosedChannels(request)
         return response.channels
 
-    def open_channel_sync(self, local_funding_amount: int, **kwargs):
-        request = ln.OpenChannelRequest(local_funding_amount=local_funding_amount, **kwargs)
+    def open_channel_sync(self,
+                          node_pubkey_string: str,
+                          local_funding_amount: int,
+                          **kwargs):
+        """
+        A synchronous (blocking) version of the 'open_channel()' command
+        """
+        request = ln.OpenChannelRequest(
+                node_pubkey_string=node_pubkey_string,
+                local_funding_amount=local_funding_amount,
+                **kwargs)
+        if not hasattr(request, 'node_pubkey'):
+            request.node_pubkey = bytes.fromhex(node_pubkey_string)
         response = self.lightning_stub.OpenChannelSync(request)
         return response
 
-    # Response-streaming RPC
-    def open_channel(self, local_funding_amount: int, **kwargs):
-        # TODO: implement `lncli openchannel --connect` function
-        request = ln.OpenChannelRequest(local_funding_amount=local_funding_amount, **kwargs)
+    def open_channel(self,
+                     node_pubkey_string: str,
+                     local_funding_amount: int,
+                     **kwargs):
+        # TODO: mirror `lncli openchannel --connect` function
+        request = ln.OpenChannelRequest(
+                node_pubkey_string=node_pubkey_string,
+                local_funding_amount=local_funding_amount,
+                **kwargs)
         if request.node_pubkey == b'':
-            request.node_pubkey = bytes.fromhex(request.node_pubkey_string)
-        for response in self.lightning_stub.OpenChannel(request):
-            print(response)
+            request.node_pubkey = bytes.fromhex(node_pubkey_string)
+        response = self.lightning_stub.OpenChannel(request)
+        return response
 
     def close_channel(self, channel_point, **kwargs):
         funding_txid, output_index = channel_point.split(':')
@@ -304,12 +354,12 @@ class Client:
         return response
 
     def close_all_channels(self, inactive_only: bool = 0):
-        if not inactive_only:
+        if inactive_only == False:
             for channel in self.list_channels():
-                return self.close_channel(channel_point=channel.channel_point)
-        if inactive_only:
+                self.close_channel(channel_point=channel.channel_point)
+        if inactive_only == True:
             for channel in self.list_channels(inactive_only=1):
-                return self.close_channel(channel_point=channel.channel_point)
+                self.close_channel(channel_point=channel.channel_point)
 
     def abandon_channel(self, channel_point: ln.ChannelPoint):
         funding_txid, output_index = channel_point.split(':')
@@ -321,37 +371,27 @@ class Client:
 
     @staticmethod
     def send_request_generator(**kwargs):
-        while True:
-            request = ln.SendRequest(**kwargs)
+        # i = 0
+         #while True:
+            if kwargs['payment_request']:
+                request = ln.SendRequest(payment_request=kwargs['payment_request'])
+            else:
+                request = ln.SendRequest(**kwargs)
             yield request
-            break
+        # i += 1
 
     # Bi-directional streaming RPC
     def send_payment(self, **kwargs):
-        # Use payment request as first choice
-        if 'payment_request' in kwargs:
-            request_iterable = self.send_request_generator(
-                    payment_request=kwargs['payment_request']
-            )
-        else:
-            # Helper to try and convert hex to bytes automatically
-            try:
-                if 'payment_hash' not in kwargs:
-                    kwargs['payment_hash'] = bytes.fromhex(kwargs['payment_hash_string'])
-                if 'dest' not in kwargs:
-                    kwargs['dest'] = bytes.fromhex(kwargs['dest_string'])
-            except ValueError as e:
-                raise e
-            request_iterable = self.send_request_generator(**kwargs)
+        request_iterable = self.send_request_generator(**kwargs)
         for response in self.lightning_stub.SendPayment(request_iterable):
             print(response)
 
-    # Synchronous non-streaming RPC
     def send_payment_sync(self, **kwargs):
-        # Use payment request as first choice
-        if 'payment_request' in kwargs:
+        if kwargs['payment_request']:
             request = ln.SendRequest(payment_request=kwargs['payment_request'])
         else:
+            kwargs['payment_hash'] = bytes.fromhex(kwargs['payment_hash_string'])
+            kwargs['dest'] = bytes.fromhex(kwargs['dest_string'])
             request = ln.SendRequest(**kwargs)
         response = self.lightning_stub.SendPaymentSync(request)
         return response
@@ -361,33 +401,27 @@ class Client:
         return response
 
     @staticmethod
-    def send_to_route_generator(invoice, route):
+    def send_to_route_generator(invoices, route):
         i = 0
-        while i < 1:
-            request = ln.SendToRouteRequest(payment_hash=invoice.r_hash, routes=route)
-            yield request
-            i += 1
+        j = len(invoices)
+        while i < j:
+            for invoice in invoices:
+                request = ln.SendToRouteRequest(payment_hash=invoice.r_hash, routes=route)
+                yield request
+                i += 1
 
-    # Bi-directional streaming RPC
-    def send_to_route(self, invoice, route):
-        request_iterable = self.send_to_route_generator(invoice=invoice, route=route)
+    def send_to_route(self, invoices, route):
+        request_iterable = self.send_to_route_generator(invoices=invoices, route=route)
         for response in self.lightning_stub.SendToRoute(request_iterable):
             print(response)
 
-    # Synchronous non-streaming RPC
     def send_to_route_sync(self, routes: ln.Route, **kwargs):
         request = ln.SendToRouteRequest(routes=routes, **kwargs)
         response = self.lightning_stub.SendToRouteSync(request)
         return response
 
-    def add_invoice(self,
-                    memo: str = '',
-                    value: int = 0,
-                    expiry: int = 3600,
-                    creation_date: int = int(time.time()),
-                    **kwargs):
-        request = ln.Invoice(memo=memo, value=value, expiry=expiry,
-                             creation_date=creation_date, **kwargs)
+    def add_invoice(self, value: int = 0, **kwargs):
+        request = ln.Invoice(value=value, **kwargs)
         response = self.lightning_stub.AddInvoice(request)
         return response
 
@@ -404,7 +438,7 @@ class Client:
     def subscribe_invoices(self, **kwargs):
         request = ln.InvoiceSubscription(**kwargs)
         for response in self.lightning_stub.SubscribeInvoices(request):
-            print(response)
+            return response
 
     def decode_pay_req(self, pay_req: str):
         request = ln.PayReqString(pay_req=pay_req)
@@ -430,12 +464,6 @@ class Client:
         request = ln.ChanInfoRequest(chan_id=chan_id)
         response = self.lightning_stub.GetChanInfo(request)
         return response
-
-    # Uni-directional stream
-    def subscribe_channel_events(self, **kwargs):
-        request = ln.ChannelEventSubscription(**kwargs)
-        for response in self.lightning_stub.SubscribeChannelEvents(request):
-            print(response)
 
     def get_node_info(self, pub_key: str):
         request = ln.NodeInfoRequest(pub_key=pub_key)
@@ -465,11 +493,10 @@ class Client:
         response = self.lightning_stub.StopDaemon(request)
         return response
 
-    # Response-streaming RPC
     def subscribe_channel_graph(self):
         request = ln.GraphTopologySubscription()
         for response in self.lightning_stub.SubscribeChannelGraph(request):
-            print(response)
+            return response
 
     def debug_level(self, **kwargs):
         request = ln.DebugLevelRequest(**kwargs)
@@ -487,13 +514,13 @@ class Client:
             _channel_point = self.channel_point_generator(funding_txid=funding_txid,
                                                           output_index=output_index)
             kwargs['chan_point'] = _channel_point
-        if 'global' not in kwargs:
+        if not 'global' in kwargs:
             kwargs['global'] = 1
         request = ln.PolicyUpdateRequest(**kwargs)
         response = self.lightning_stub.UpdateChannelPolicy(request)
         return response
 
-    def forwarding_history(self, start_time: int, **kwargs):
+    def forwarding_history(self, start_time: int = 0, **kwargs):
         request = ln.ForwardingHistoryRequest(start_time=start_time, **kwargs)
         response = self.lightning_stub.ForwardingHistory(request)
         return response
