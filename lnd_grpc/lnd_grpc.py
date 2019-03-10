@@ -406,8 +406,7 @@ class Client:
 
     def subscribe_invoices(self, **kwargs):
         request = ln.InvoiceSubscription(**kwargs)
-        for response in self.lightning_stub.SubscribeInvoices(request):
-            print(response)
+        return self.lightning_stub.SubscribeInvoices(request)
 
     def decode_pay_req(self, pay_req: str):
         request = ln.PayReqString(pay_req=pay_req)
