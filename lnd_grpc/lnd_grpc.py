@@ -9,10 +9,15 @@ from lnd_grpc import utilities as u
 from lnd_grpc.protos import rpc_pb2 as ln, rpc_pb2_grpc as lnrpc
 
 # tell gRPC which cypher suite to use
+from lnd_grpc.protos.rpc_pb2_grpc import LightningStub, WalletUnlockerStub
+
 environ["GRPC_SSL_CIPHER_SUITES"] = 'HIGH+ECDSA'
 
 
 class Client:
+
+    _w_stub: WalletUnlockerStub
+    _lightning_stub: LightningStub
 
     def __init__(self,
                  lnd_dir: str = None,
@@ -22,15 +27,15 @@ class Client:
                  grpc_host: str = 'localhost',
                  grpc_port: str = '10009'):
 
+        self._lightning_stub = None
+        self._w_stub = None
+
         self.lnd_dir = lnd_dir
         self.macaroon_path = macaroon_path
         self.tls_cert_path = tls_cert_path
         self.network = network
         self.grpc_host = grpc_host
         self.grpc_port = grpc_port
-        self.cert_creds = None
-        self.auth_creds = None
-        self.combined_creds = None
         self.channel = None
         self.grpc_options = [
             ('grpc.max_receive_message_length', 33554432),
@@ -62,15 +67,17 @@ class Client:
     @property
     def tls_cert_key(self):
         try:
-            self._tls_cert_key = open(self.tls_cert_path, 'rb').read()
+            tls_cert_key = open(self.tls_cert_path, 'rb').read()
         except FileNotFoundError:
             sys.stderr.write("TLS cert not found at %s" % self.tls_cert_path)
+            raise
         try:
-            assert self._tls_cert_key.startswith(b'-----BEGIN CERTIFICATE-----')
-            return self._tls_cert_key
+            assert tls_cert_key.startswith(b'-----BEGIN CERTIFICATE-----')
+            return tls_cert_key
         except (AssertionError, AttributeError):
-            sys.stderr.write("TLS cert at %s did not start with b'-----BEGIN CERTIFICATE-----')" \
+            sys.stderr.write("TLS cert at %s did not start with b'-----BEGIN CERTIFICATE-----')"
                              % self.tls_cert_path)
+            raise
 
     @property
     def macaroon_path(self):
@@ -91,23 +98,24 @@ class Client:
         try:
             with open(self.macaroon_path, 'rb') as f:
                 macaroon_bytes = f.read()
-                self._macaroon = codecs.encode(macaroon_bytes, 'hex')
-                return self._macaroon
+                macaroon = codecs.encode(macaroon_bytes, 'hex')
+                return macaroon
         except FileNotFoundError:
             sys.stderr.write("Could not find macaroon in %s\n" % self.macaroon_path)
 
+    # noinspection PyUnusedLocal
     def metadata_callback(self, context, callback):
         callback([('macaroon', self.macaroon)], None)
 
-    def build_credentials(self):
-        self.cert_creds = grpc.ssl_channel_credentials(self.tls_cert_key)
-        self.auth_creds = grpc.metadata_call_credentials(self.metadata_callback)
-        self.combined_creds = grpc.composite_channel_credentials(self.cert_creds, self.auth_creds)
+    @property
+    def combined_credentials(self):
+        cert_creds = grpc.ssl_channel_credentials(self.tls_cert_key)
+        auth_creds = grpc.metadata_call_credentials(self.metadata_callback)
+        return grpc.composite_channel_credentials(cert_creds, auth_creds)
 
     @property
     def grpc_address(self):
-        self._address = str(self.grpc_host + ':' + self.grpc_port)
-        return self._address
+        return str(self.grpc_host + ':' + self.grpc_port)
 
     @staticmethod
     def channel_point_generator(funding_txid, output_index):
@@ -125,37 +133,21 @@ class Client:
     def bytes_to_hex(bytestring: bytes):
         return bytestring.hex()
 
-    # Connection stubs will be generated dynamically for each request to ensure channel freshness
-    # This can slow down interfacing programs considerably. Performance can be increased by
-    # configuring a static lightning stub to use. This can be done simply by removing the property
-    # decorator from the stub class below.
     @property
-    def lightning_stub(self,
-                       cert_path: str = None,
-                       macaroon_path: str = None):
-
-        # set options
-        if cert_path is not None:
-            self.tls_cert_path = cert_path
-        if macaroon_path is not None:
-            self.macaroon_path = macaroon_path
-
-        self.build_credentials()
+    def lightning_stub(self):
         self.channel = grpc.secure_channel(target=self.grpc_address,
-                                           credentials=self.combined_creds,
+                                           credentials=self.combined_credentials,
                                            options=self.grpc_options)
-        self._lightning_stub = lnrpc.LightningStub(self.channel)
+        if self._lightning_stub is None:
+            self._lightning_stub = lnrpc.LightningStub(self.channel)
         return self._lightning_stub
 
     @property
-    def wallet_unlocker_stub(self,
-                             cert_path: str = None):
-        if cert_path is not None:
-            self.tls_cert_path = cert_path
-        self.ssl_creds = grpc.ssl_channel_credentials(self.tls_cert_key)
-        self._w_channel = grpc.secure_channel(self.grpc_address,
-                                              self.ssl_creds)
-        self._w_stub = lnrpc.WalletUnlockerStub(self._w_channel)
+    def wallet_unlocker_stub(self):
+        ssl_creds = grpc.ssl_channel_credentials(self.tls_cert_key)
+        if self._w_stub is None:
+            _w_channel = grpc.secure_channel(self.grpc_address, ssl_creds)
+            self._w_stub = lnrpc.WalletUnlockerStub(_w_channel)
         return self._w_stub
 
     def gen_seed(self, **kwargs):
