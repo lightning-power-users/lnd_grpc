@@ -249,15 +249,16 @@ class Client:
         response = self.lightning_stub.VerifyMessage(request)
         return response
 
-    def connect_peer(self, addr: ln.LightningAddress, perm: bool = 0):
+    def connect_peer(self, addr: ln.LightningAddress, perm: bool = 0,
+                     timeout: int = None):
         request = ln.ConnectPeerRequest(addr=addr, perm=perm)
-        response = self.lightning_stub.ConnectPeer(request)
+        response = self.lightning_stub.ConnectPeer(request, timeout=timeout)
         return response
 
-    def connect(self, address: str, perm: bool = 0):
+    def connect(self, address: str, perm: bool = 0, timeout: int = None):
         pubkey, host = address.split('@')
         _address = self.lightning_address(pubkey=pubkey, host=host)
-        response = self.connect_peer(addr=_address, perm=perm)
+        response = self.connect_peer(addr=_address, perm=perm, timeout=timeout)
         return response
 
     def disconnect_peer(self, pubkey: str):
@@ -296,12 +297,13 @@ class Client:
         return response
 
     # Response-streaming RPC
-    def open_channel(self, local_funding_amount: int, **kwargs):
+    def open_channel(self, local_funding_amount: int, timeout: int = None,
+                     **kwargs):
         # TODO: implement `lncli openchannel --connect` function
         request = ln.OpenChannelRequest(local_funding_amount=local_funding_amount, **kwargs)
         if request.node_pubkey == b'':
             request.node_pubkey = bytes.fromhex(request.node_pubkey_string)
-        return self.lightning_stub.OpenChannel(request)
+        return self.lightning_stub.OpenChannel(request, timeout=timeout)
 
     def close_channel(self, channel_point, **kwargs):
         funding_txid, output_index = channel_point.split(':')
